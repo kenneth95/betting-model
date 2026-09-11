@@ -1,110 +1,90 @@
-# EPL Betting Intelligence — Research Engine
+# Betting model
 
-Quantitative research pipeline for EPL match probabilities, market
-comparison, and betting-value evaluation. See **FINDINGS.md** for what
-this pipeline has found so far and why several early results turned
-out not to hold up — read that before trusting any number in here.
+League-agnostic Dixon-Coles Poisson model, structured so adding a new
+league is a config change, not a code change.
 
-## Project layout
+## Folder layout
 
 ```
-src/
-  data/         raw file ingestion, deduplication, inspection
-  features/     pre-match feature engineering (form, market, Elo, rest)
-  models/       single-split model comparison (quick sanity check)
-  calibration/  model pipelines + calibration/classification diagnostics
-  betting/      fair-odds/EV math, bet selection, betting metrics, bootstrap
-  evaluation/   walk-forward engine (primary), single-split backtest (legacy)
-  export/       pushes production predictions to the Supabase-backed app
-  utils/        config.py — single source of truth for paths/features/dates
-data/
-  raw/          original football-data.co.uk season files
-  processed/    epl_master.csv → epl_features.csv → epl_model_data.csv → epl_model_data_extra.csv
-  upcoming/     fixtures_template.csv (copy to fixtures.csv and fill in odds by hand)
-models/         saved metrics, predictions, and the walk_forward/ output directory
+betting_model/
+├── config/leagues.yaml     # <- add a league here
+├── data/raw/<code>/        # <- drop that league's CSVs here
+├── models/<code>/          # fitted ratings + backtest results, generated
+├── src/betting_model/      # core package, never references a league name
+├── scripts/                # CLIs: fit_and_predict.py, run_backtest.py
+└── tests/                  # pytest
 ```
 
-Every script reads its paths and feature lists from `src/utils/config.py`
-— nothing is hardcoded or duplicated across scripts. If you need to
-change a date boundary, a feature list, an EV threshold, or the random
-seed, change it there once.
+## Adding a new league
+
+1. Create `data/raw/<code>/` and drop that league's football-data.co.uk
+   season CSVs in it (rename them so multiple seasons don't overwrite -
+   football-data.co.uk names every EPL file `E0.csv`, every La Liga file
+   `SP1.csv`, etc., so add a season suffix yourself).
+2. Add an entry to `config/leagues.yaml`:
+   ```yaml
+   - code: la_liga
+     name: La Liga
+     data_folder: data/raw/la_liga
+     api_sports_league_id: 140
+     bookmaker_prefix: null
+     model_overrides: {}
+   ```
+3. Run it:
+   ```
+   python scripts/fit_and_predict.py --league la_liga
+   python scripts/run_backtest.py --league la_liga
+   ```
+
+Nothing in `src/betting_model/` changes. `model_overrides` lets you tune
+hyperparameters per league if needed (e.g. a smaller league with fewer
+matches per season might want more shrinkage — higher `l2_penalty`).
+
+## Day-to-day commands
+
+```bash
+# One-time / occasional: fit a league's model and save its ratings
+python scripts/fit_and_predict.py --league epl
+
+# Cheap: predict a fixture from the last saved fit, no refitting
+python scripts/fit_and_predict.py --league epl --load-only --home Arsenal --away Chelsea
+
+# Validate the model before trusting it: walk-forward backtest
+python scripts/run_backtest.py --league epl
+```
 
 ## Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install pandas numpy scikit-learn scipy matplotlib
-pip install supabase  # only needed for src/export/push_predictions.py
+pip install -r requirements.txt
+python scripts/make_synthetic_data.py   # optional: generates a synthetic
+                                          # "epl_test" league (already
+                                          # registered in leagues.yaml) so
+                                          # you can verify everything runs
+                                          # before touching real data
+python -m pytest tests/                  # run the test suite
 ```
 
-## Running the pipeline
+## Why fit/predict are separated
 
-Run every command from the project root (the directory containing
-`src/`), using `-m` so the package imports resolve correctly:
+`DixonColesModel.fit()` runs an optimization over the whole match history
+and takes a few seconds. You don't want that happening on every user
+request. The pattern is:
 
-```bash
-# 1. Data ingestion (only needed if data/raw/ changes)
-python -m src.data.create_master
-python -m src.data.check_duplicates      # optional sanity check
+- **Fit weekly** (or whenever you pull new results) via
+  `fit_and_predict.py`, which saves ratings to `models/<code>/latest.json`.
+- **Predict on demand** by loading that saved file (`DixonColesModel.load()`
+  or `--load-only`), which is near-instant — no re-optimization.
 
-# 2. Feature engineering
-python -m src.features.build_features
-python -m src.features.add_market_features
-python -m src.features.build_extra_features   # Elo + rest/congestion
+This is also the shape you'll want once this plugs into the Supabase/Vercel
+pipeline: the weekly job fits and writes ratings, your app's prediction
+logic just reads them.
 
-# 3. Quick single-split model comparison (NOT the primary evaluation —
-#    see FINDINGS.md for why a single test season is unreliable)
-python -m src.models.train_models
-python -m src.evaluation.backtest
-python -m src.evaluation.analyze_backtest
+## Caveats carried over from the single-league version
 
-# 4. PRIMARY EVALUATION — walk-forward, all 9 out-of-sample seasons,
-#    calibration, and betting significance testing
-python -m src.evaluation.walk_forward
-```
-
-`walk_forward.py` is the one to trust. It writes its full output to
-`models/walk_forward/` (CSVs + a reliability plot under `plots/`).
-
-## Pushing predictions to the app
-
-```bash
-cp data/upcoming/fixtures_template.csv data/upcoming/fixtures.csv
-# edit fixtures.csv: home_team, away_team, kickoff_utc, B365H, B365D, B365A
-# (AvgH/D/A optional — leave blank if you don't have a multi-bookmaker
-# average yet, it'll fall back to B365 like the historical dataset does)
-
-export SUPABASE_URL=...              # from Supabase project settings > API
-export SUPABASE_SERVICE_ROLE_KEY=... # service_role key, NOT anon — never expose this to the app/browser
-
-python -m src.export.push_predictions
-```
-
-This trains the production model (Team + Market, sigmoid-calibrated —
-`config.PRODUCTION_MODEL_NAME`/`PRODUCTION_FEATURES`) on **all**
-historical data, computes features for each fixture in
-`fixtures.csv` using the exact same functions training uses
-(`compute_team_form_features`, `compute_market_features` — not a second
-hand-written copy), and upserts `teams` / `matches` / `model_versions` /
-`predictions` into Supabase. Safe to re-run: matches and predictions are
-upserted on their natural keys, not re-inserted.
-
-Team names in `fixtures.csv` must exactly match how they appear in the
-historical data (the script validates this and lists any it doesn't
-recognize) — check spelling for promoted teams especially.
-
-## Reproducibility
-
-- All randomness (model fitting, bootstrap resampling) is seeded via
-  `config.RANDOM_STATE = 42`.
-- EV thresholds (`config.EV_THRESHOLDS`) are fixed in `config.py` and
-  were never adjusted after seeing a result — see FINDINGS.md's
-  "what was and wasn't tuned against test data" section for the exact
-  boundary of what counts as pre-specified here.
-- Every feature list has a `config.assert_no_leakage()` check run at
-  the start of `walk_forward.py` that raises if a post-match column
-  (`FTHG`, `HS`, etc.) is ever accidentally included.
-- Re-running the full pipeline end-to-end with the same input data
-  reproduces the same row/column counts and metrics reported in
-  FINDINGS.md exactly (verified while building this).
+- The synthetic `epl_test` league exists purely to verify the code runs —
+  its placeholder odds are not realistic, so its backtest numbers are
+  meaningless. Delete it once you trust your real backtests.
+- See `src/betting_model/poisson_model.py`'s docstring for the full
+  explanation of how promotion/relegation is handled (time decay,
+  shrinkage, and the fallback prior for teams with no history at all).
